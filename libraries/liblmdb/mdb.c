@@ -167,7 +167,11 @@ typedef SSIZE_T	ssize_t;
 # if !(defined(MDB_USE_POSIX_MUTEX) || defined(MDB_USE_POSIX_SEM))
 # define MDB_USE_SYSV_SEM	1
 # endif
+# if defined(__APPLE__)
+# define MDB_FDATASYNC(fd)		fcntl(fd, F_FULLFSYNC)
+# else
 # define MDB_FDATASYNC		fsync
+# endif
 #elif defined(__ANDROID__)
 # define MDB_FDATASYNC		fsync
 #endif
@@ -2883,7 +2887,7 @@ mdb_env_sync0(MDB_env *env, int force, pgno_t numpgs)
 				? MS_ASYNC : MS_SYNC;
 			if (MDB_MSYNC(env->me_map, env->me_psize * numpgs, flags))
 				rc = ErrCode();
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
 			else if (flags == MS_SYNC && MDB_FDATASYNC(env->me_fd))
 				rc = ErrCode();
 #endif
@@ -3305,9 +3309,8 @@ renew:
 	}
 	if (rc) {
 		if (txn != env->me_txn0) {
-#ifdef MDB_VL32
-			free(txn->mt_rpages);
-#endif
+			/* mt_rpages is owned by parent */
+			free(txn->mt_u.dirty_list);
 			free(txn);
 		}
 	} else {
@@ -5078,6 +5081,9 @@ mdb_env_open2(MDB_env *env, int prev)
 	env->me_maxkey = env->me_nodemax - (NODESIZE + sizeof(MDB_db));
 #endif
 	env->me_maxpg = env->me_mapsize / env->me_psize;
+
+	if (prev && env->me_txns)
+		env->me_txns->mti_txnid = meta.mm_txnid;
 
 #if MDB_DEBUG
 	{
@@ -9622,7 +9628,7 @@ mdb_cursor_del0(MDB_cursor *mc)
 						goto fail;
 				}
 				if (m3->mc_xcursor && !(m3->mc_flags & C_EOF)) {
-					MDB_node *node = NODEPTR(m3->mc_pg[m3->mc_top], m3->mc_ki[m3->mc_top]);
+					MDB_node *node = NODEPTR(m3->mc_pg[mc->mc_top], m3->mc_ki[mc->mc_top]);
 					/* If this node has dupdata, it may need to be reinited
 					 * because its data has moved.
 					 * If the xcursor was not initd it must be reinited.
@@ -10191,8 +10197,8 @@ typedef struct mdb_copy {
 	pthread_cond_t mc_cond;	/**< Condition variable for #mc_new */
 	char *mc_wbuf[2];
 	char *mc_over[2];
-	int mc_wlen[2];
-	int mc_olen[2];
+	size_t mc_wlen[2];
+	size_t mc_olen[2];
 	pgno_t mc_next_pgno;
 	HANDLE mc_fd;
 	int mc_toggle;			/**< Buffer number in provider */
@@ -10209,7 +10215,8 @@ mdb_env_copythr(void *arg)
 {
 	mdb_copy *my = arg;
 	char *ptr;
-	int toggle = 0, wsize, rc;
+	int toggle = 0, rc;
+	size_t wsize;
 #ifdef _WIN32
 	DWORD len;
 #define DO_WRITE(rc, fd, ptr, w2, len)	rc = WriteFile(fd, ptr, w2, &len, NULL)
